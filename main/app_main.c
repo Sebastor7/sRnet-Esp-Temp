@@ -19,7 +19,14 @@
 #include <esp_event.h>
 #include <nvs_flash.h>
 
+#include "driver/i2c.h"
+#include "sht30.h"
+
 #include <wifi_provisioning/manager.h>
+
+#include "mqtt_client.h"
+
+#include "esp_log.h"
 
 #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_BLE
 #include <wifi_provisioning/scheme_ble.h>
@@ -31,6 +38,17 @@
 #include "qrcode.h"
 
 static const char *TAG = "app";
+
+esp_mqtt_client_handle_t mqtt_client = NULL;
+
+sht30_t   sht30;
+
+static void log_error_if_nonzero(const char *message, int error_code)
+{
+    if (error_code != 0) {
+        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
+    }
+}
 
 #if CONFIG_EXAMPLE_PROV_SECURITY_VERSION_2
 #if CONFIG_EXAMPLE_PROV_SEC2_DEV_MODE
@@ -280,8 +298,30 @@ static void wifi_prov_print_qr(const char *name, const char *username, const cha
     ESP_LOGI(TAG, "If QR code is not visible, copy paste the below URL in a browser.\n%s?data=%s", QRCODE_BASE_URL, payload);
 }
 
-void app_main(void)
-{
+void i2c_ini(void){
+    const i2c_config_t i2c_conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = 22,
+        .scl_io_num = 23,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+    };
+    /* Initialize I2C */
+    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &i2c_conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, i2c_conf.mode, 0, 0, 0));
+}
+
+void sht30_ini(void){
+    sht30.i2c_port = I2C_NUM_0;
+    sht30.addr = 0x44;
+    if (sht30_init(&sht30) != ESP_OK)
+    {
+        // error handling...
+    }
+}
+
+void provisioning(void){
     /* Initialize NVS partition */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -357,7 +397,7 @@ void app_main(void)
 
 #endif
     /* If device is not yet provisioned start provisioning service */
-    if (!provisioned) {
+    if (0)/*(!provisioned)*/ {
         ESP_LOGI(TAG, "Starting provisioning");
 
         /* What is the Device Service Name that we want
@@ -497,26 +537,158 @@ void app_main(void)
 
     /* Wait for Wi-Fi connection */
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+}
 
-    /* Start main application now */
-#if CONFIG_EXAMPLE_REPROVISIONING
-    while (1) {
-        for (int i = 0; i < 10; i++) {
-            ESP_LOGI(TAG, "Hello World!");
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+/*
+ * @brief Event handler registered to receive MQTT events
+ *
+ *  This function is called by the MQTT client event loop.
+ *
+ * @param handler_args user data registered to the event.
+ * @param base Event base for the handler(always MQTT Base in this example).
+ * @param event_id The id for the received event.
+ * @param event_data The data for the event, esp_mqtt_event_handle_t.
+ */
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    esp_mqtt_client_handle_t client = event->client;
+    int msg_id;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        msg_id = esp_mqtt_client_publish(client, "/topic/qos1", "test 23", 0, 1, 0);
+        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+
+        msg_id = esp_mqtt_client_subscribe(client, "/topic/qos0", 0);
+        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+
+        msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 1);
+        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+
+        msg_id = esp_mqtt_client_unsubscribe(client, "/topic/qos1");
+        ESP_LOGI(TAG, "sent unsubscribe successful, msg_id=%d", msg_id);
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        msg_id = esp_mqtt_client_publish(client, "/topic/qos0", "data", 0, 0, 0);
+        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+        break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+        printf("DATA=%.*s\r\n", event->data_len, event->data);
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
+            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
+            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
+            ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+
         }
-
-        /* Resetting provisioning state machine to enable re-provisioning */
-        wifi_prov_mgr_reset_sm_state_for_reprovision();
-
-        /* Wait for Wi-Fi connection */
-        xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+        break;
+    default:
+        ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+        break;
     }
-#else
-     while (1) {
-         ESP_LOGI(TAG, "Hello World!");
-         vTaskDelay(1000 / portTICK_PERIOD_MS);
+}
+
+// Function to start MQTT
+void mqtt_app_start(void) {
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.hostname = "192.168.1.101",
+        .broker.address.transport = MQTT_TRANSPORT_OVER_TCP,
+        .broker.address.port = 1883
+    };
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+// Function to publish sensor data via MQTT
+void publish_sensor_data(float temperature, float humidity) {
+    char temp_str[32], hum_str[32];
+    snprintf(temp_str, sizeof(temp_str), "%.2f", temperature);
+    snprintf(hum_str, sizeof(hum_str), "%.2f", humidity);
+
+    if (mqtt_client != NULL) {
+        esp_mqtt_client_publish(mqtt_client, "/sensor/temperature", temp_str, 0, 1, 0);
+        esp_mqtt_client_publish(mqtt_client, "/sensor/humidity", hum_str, 0, 1, 0);
+    }
+}
+
+// Task to read SHT30 data and publish it via MQTT
+void sht30_task(void *param) {
+    while (1) {
+        float temperature = sht30_get_temperature(&sht30, true);
+        float humidity = sht30_get_humidity(&sht30, false);
+
+        ESP_LOGI(TAG, "SHT30: %.2f °C, %.2f %%", temperature, humidity);
+        
+        // Publish data via MQTT
+        publish_sensor_data(temperature, humidity);
+
+        // Delay for 10 seconds
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
+void app_main(void)
+{
+    provisioning();
+
+    #if CONFIG_EXAMPLE_REPROVISIONING
+        while (1) {
+            for (int i = 0; i < 10; i++) {
+                ESP_LOGI(TAG, "Hello World!");
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+            }
+
+            /* Resetting provisioning state machine to enable re-provisioning */
+            wifi_prov_mgr_reset_sm_state_for_reprovision();
+
+            /* Wait for Wi-Fi connection */
+            xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, true, true, portMAX_DELAY);
+        }
+    #else 
+     
+    i2c_ini();
+
+    sht30_ini();
+      
+    // Start MQTT client
+    mqtt_app_start();
+
+    // Create SHT30 task
+    xTaskCreate(sht30_task, "sht30_task", 4096, NULL, 5, NULL);
+
+    
+    /*
+    while (1) {
+
+        printf("SHT30: %5.2f C %5.2f %%\n",
+            sht30_get_temperature(&sht30, true),
+            sht30_get_humidity(&sht30, false)
+        );
+         //ESP_LOGI(TAG, "Hello World!");
+         vTaskDelay(10000 / portTICK_PERIOD_MS);
      }
-#endif
+     */
+    #endif
+
 
 }
