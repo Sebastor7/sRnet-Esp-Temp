@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/gpio.h"
+#include "button.h"
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
@@ -36,6 +39,9 @@
 #include <wifi_provisioning/scheme_softap.h>
 #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
 #include "qrcode.h"
+
+#define LED_GPIO 15
+static uint8_t led_state = 0;
 
 static const char *TAG = "app";
 
@@ -298,6 +304,58 @@ static void wifi_prov_print_qr(const char *name, const char *username, const cha
     ESP_LOGI(TAG, "If QR code is not visible, copy paste the below URL in a browser.\n%s?data=%s", QRCODE_BASE_URL, payload);
 }
 
+static void board_led_init(void)
+{
+    gpio_reset_pin(LED_GPIO);
+    /* Set the GPIO as a push/pull output */
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+}
+
+// Callback function to handle button events
+void button_event_handler(button_event_t event) {
+    esp_err_t ret;
+    switch (event) {
+        case BUTTON_SHORT_PRESS:
+            printf("Main: Short press detected!\n");
+            // Add logic for short press event here
+            break;
+
+        case BUTTON_LONG_PRESS:
+            printf("Main: Long press detected!\n");
+            // Add logic for long press event here
+
+            ret = esp_wifi_disconnect();
+                if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "Disconnected from Wi-Fi");
+            } else {
+                ESP_LOGE(TAG, "Failed to disconnect from Wi-Fi: %s", esp_err_to_name(ret));
+                //show err led
+            }
+            
+            ret = nvs_flash_init();
+                if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+                ESP_ERROR_CHECK(nvs_flash_erase());
+                ESP_ERROR_CHECK(nvs_flash_init());
+            }
+
+            // Erase Wi-Fi credentials from NVS
+            ESP_ERROR_CHECK(esp_wifi_restore());  // This erases saved Wi-Fi credentials
+
+            ESP_LOGI(TAG, "Wi-Fi credentials erased, resetting provisioning.");
+            
+            esp_restart();     
+            break;
+
+        case BUTTON_RELEASE:
+            printf("Main: Button released!\n");
+            // Add logic for button release event here
+            break;
+
+        default:
+            break;
+    }
+}
+
 void i2c_ini(void){
     const i2c_config_t i2c_conf = {
         .mode = I2C_MODE_MASTER,
@@ -397,7 +455,7 @@ void provisioning(void){
 
 #endif
     /* If device is not yet provisioned start provisioning service */
-    if (0)/*(!provisioned)*/ {
+    if (!provisioned) {
         ESP_LOGI(TAG, "Starting provisioning");
 
         /* What is the Device Service Name that we want
@@ -642,6 +700,9 @@ void sht30_task(void *param) {
         // Publish data via MQTT
         publish_sensor_data(temperature, humidity);
 
+        led_state = !led_state;
+        gpio_set_level(LED_GPIO, led_state);
+
         // Delay for 10 seconds
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
@@ -649,6 +710,8 @@ void sht30_task(void *param) {
 
 void app_main(void)
 {
+    board_led_init();
+    button_init();
     provisioning();
 
     #if CONFIG_EXAMPLE_REPROVISIONING
@@ -667,7 +730,6 @@ void app_main(void)
     #else 
      
     i2c_ini();
-
     sht30_ini();
       
     // Start MQTT client
@@ -675,6 +737,9 @@ void app_main(void)
 
     // Create SHT30 task
     xTaskCreate(sht30_task, "sht30_task", 4096, NULL, 5, NULL);
+
+        // Register the callback to handle button events
+    button_register_callback(button_event_handler);
 
     
     /*
